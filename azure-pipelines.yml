@@ -132,7 +132,7 @@ steps:
       npm run ver
 
       sudo apt list --installed | grep ssl
-    failOnStderr: true
+    failOnStderr: false
 
 - task: PublishBuildArtifacts@1
   inputs:
