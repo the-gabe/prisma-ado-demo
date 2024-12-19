@@ -1,0 +1,141 @@
+trigger: none
+pr: none
+
+pool:
+  vmImage: ubuntu-22.04
+# Rationale for choosing Ubuntu 22.04 is due to the glibc version
+# If the build is done on an OS with a glibc version which is too new,
+# it will break on an OS using an older glibc version! This is because 
+# NodeJS apps frequently call into native code, which is compiled at 
+# build time here. OpenSSL version should probably not matter, but
+# is mentioned here, as prisma ORM uses it for TLS communications.
+#
+# Debian 12 is what Azure App Service uses, and so Ubuntu 22.04 is the
+# best option
+# 
+# Ubuntu 24.04 uses glibc 2.39 and OpenSSL 3.x
+# Debian 12    uses glibc 2.36 and OpenSSL 3.x
+# Ubuntu 22.04 uses glibc 2.35 and OpenSSL 3.x
+# Ubuntu 20.04 uses glibc 2.31 and OpenSSL 1.1.1
+
+steps:
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: 'sudo apt-get update && sudo apt-get install libarchive-tools -y'
+    failOnStderr: true
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |  
+      # Check for the latest NodeJS 20 version
+      LATEST_NODE=$(curl --tlsv1.3 -s https://nodejs.org/dist/index.json | jq -re '.[] | select(.version | startswith("v20")) | .version' | head -n 1)
+
+      # make and cd dir in tmp
+      mkdir /tmp/node-install/
+      cd /tmp/node-install/
+
+      # Get SHA256s, signature and binaries for the desired version
+      curl -O --tlsv1.3 -s --output /tmp/node-install/SHASUMS256.txt https://nodejs.org/dist/$LATEST_NODE/SHASUMS256.txt
+      curl -O --tlsv1.3 -s --output /tmp/node-install/SHASUMS256.txt.sig https://nodejs.org/dist/$LATEST_NODE/SHASUMS256.txt.sig
+      curl -O --tlsv1.3 -s --output /tmp/node-install/node-$LATEST_NODE-linux-x64.tar.xz https://nodejs.org/dist/$LATEST_NODE/node-$LATEST_NODE-linux-x64.tar.xz
+
+      # Check SHA256 of the binaries tar, this is done BEFORE gpg checks because it is far less attack surface than GPG
+      grep node-v*-linux-x64.tar.xz SHASUMS256.txt | sha256sum -c -
+      if [ $? -ne 0 ]; then
+        echo "File does not match pinned SHA256 hash. Potential supply chain attack detected on NodeJS CDN."
+        exit 1
+      fi
+    failOnStderr: true
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Go back to dir we used in previous task
+      cd /tmp/node-install/
+
+      # Import GPG keys used to sign NodeJS releases
+      # TODO: Ask NodeJS release team to move to using SSH for signing as GPG is dated and importing keys from key
+      # servers is pretty terrible as a concept, especially when considering that gpg is written in very sketchy C code
+      # These GPG keys are taken from https://github.com/nodejs/node?tab=readme-ov-file#release-keys
+      # stdout and stderr is sent to /dev/null here because gpg always logs things to stderr, because gpg is gpg
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys 4ED778F539E3634C779C87C6D7062848A1AB005C # Beth Griggs
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys 141F07595B7B3FFE74309A937405533BE57C7D57 # Bryan English
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys 74F12602B6F1C4E913FAA37AD3A89613643B6201 # Danielle Adams
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7 # Juan José Arboleda
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys CC68F5A3106FF448322E48ED27F5E38D5B0A215F # Marco Ippolito
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys 8FCCA13FEF1D0C2E91008E09770F7A9A5AE15600 # Michaël Zasso
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys 890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4 # Rafael Gonzaga
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C # Richard Lau
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys 108F52B48DB57BB0CC439B2997B01419BD92F80A # Ruy Adorno
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys A363A499291CBBC940DD62E41F10027AF002F8B0 # Ulises Gascón
+
+      # Check GPG signature
+      gpg --verify /tmp/node-install/SHASUMS256.txt.sig /tmp/node-install/SHASUMS256.txt
+      if [ $? -ne 0 ]; then
+        echo "File does not match signature. Potential supply chain attack detected on NodeJS CDN."
+        exit 1
+      fi
+    failOnStderr: false # GPG prints a lot of stuff to stderr, but this is useful in 
+                        # an analysis context, so allow it and don't silence it by piping to /dev/null
+                        # this is why this portion is in a different bash task
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Go back to dir we used in previous task
+      cd /tmp/node-install/
+
+      # Extract and place into path
+      bsdtar xf node-v*-linux-x64.tar.xz
+      sudo rsync -a node-v*-linux-x64/ /usr/local/
+      rm -rf node-v*-linux-*
+      rm -rf SHA256*
+
+      # Print NodeJS and NPM version to console
+      export PATH="/usr/local/bin:$PATH"
+      echo "node is $(node -v) at $(whereis node)"
+      echo "npm is $(npm -v) at $(whereis npm)"
+      echo "npx is $(npx -v) at $(whereis npx)"
+      echo "corepack is $(corepack -v) at $(whereis corepack)"
+    failOnStderr: true
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |
+      export TURBO_TELEMETRY_DISABLED="1"
+      export DO_NOT_TRACK="1"
+      # export PRISMA_CLI_BINARY_TARGETS="debian-openssl-3.0.x"
+
+      npm ci --no-scripts --loglevel error
+
+      echo "everything node_modules only"
+      find . -name *openssl*
+            
+      rm -rf node_modules
+
+      export NODE_ENV=production
+      npm ci --no-scripts --loglevel error
+      
+      echo "prod mode node_modules only"
+      find . -name *openssl*
+
+      npm run gen # Added for good measure because of different OpenSSL versions on different distros
+
+      echo "prod node_modules and prisma generate"
+      find . -name *openssl*
+
+      npm run ver
+
+      sudo apt list --installed | grep ssl
+    failOnStderr: true
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'drop'
+    publishLocation: 'Container'
